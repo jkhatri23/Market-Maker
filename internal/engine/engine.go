@@ -14,19 +14,23 @@ import (
 	"github.com/jkhatri23/Market-Maker/internal/alerts"
 	"github.com/jkhatri23/Market-Maker/internal/config"
 	"github.com/jkhatri23/Market-Maker/internal/exchange"
+	"github.com/jkhatri23/Market-Maker/internal/hedger"
 	"github.com/jkhatri23/Market-Maker/internal/metrics"
 	"github.com/jkhatri23/Market-Maker/internal/pricefeed"
 	"github.com/jkhatri23/Market-Maker/internal/risk"
 	"github.com/jkhatri23/Market-Maker/internal/storage"
 )
 
-// Engine orchestrates one asset worker per enabled asset. Each worker
-// reconciles whenever the reference price moves enough or the periodic
-// safety tick fires.
+// Engine orchestrates the asset workers. We quote on the maker venue;
+// every fill on the maker venue triggers a hedge order on the hedge
+// venue (if one is configured). Both venues' fills flow into the risk
+// Book so net position is correct across the pair.
 type Engine struct {
 	cfg      *config.Config
 	feed     pricefeed.PriceFeed
-	venue    exchange.Exchange
+	maker    exchange.Exchange
+	hedge    exchange.Exchange // nil = single-venue MM
+	hedger   hedger.Hedger
 	risk     *risk.Manager
 	sink     storage.Sink
 	notifier alerts.Notifier
@@ -36,7 +40,9 @@ type Engine struct {
 
 type Deps struct {
 	Feed     pricefeed.PriceFeed
-	Venue    exchange.Exchange
+	Maker    exchange.Exchange
+	Hedge    exchange.Exchange // optional
+	Hedger   hedger.Hedger     // optional; defaults to NoopHedger
 	Risk     *risk.Manager
 	Sink     storage.Sink
 	Notifier alerts.Notifier
@@ -53,10 +59,15 @@ func New(cfg *config.Config, deps Deps, logger *zap.Logger) *Engine {
 	if deps.Metrics == nil {
 		deps.Metrics = metrics.New()
 	}
+	if deps.Hedger == nil {
+		deps.Hedger = hedger.NoopHedger{}
+	}
 	e := &Engine{
 		cfg:      cfg,
 		feed:     deps.Feed,
-		venue:    deps.Venue,
+		maker:    deps.Maker,
+		hedge:    deps.Hedge,
+		hedger:   deps.Hedger,
 		risk:     deps.Risk,
 		sink:     deps.Sink,
 		notifier: deps.Notifier,
@@ -74,18 +85,30 @@ func New(cfg *config.Config, deps Deps, logger *zap.Logger) *Engine {
 // that pumps fills into the risk manager. Blocks until ctx ends or any
 // worker returns an error.
 func (e *Engine) Run(ctx context.Context) error {
-	if e.venue == nil {
-		return errors.New("engine.Run: nil venue")
+	if e.maker == nil {
+		return errors.New("engine.Run: nil maker venue")
 	}
-	e.logger.Info("engine starting", zap.String("venue", e.venue.Name()))
+	hedgeName := "(none)"
+	if e.hedge != nil {
+		hedgeName = e.hedge.Name()
+	}
+	e.logger.Info("engine starting",
+		zap.String("maker", e.maker.Name()),
+		zap.String("hedge", hedgeName),
+	)
 
 	g, gctx := errgroup.WithContext(ctx)
 
-	g.Go(func() error { return e.pumpFills(gctx) })
+	// Maker fills: feed risk + trigger hedger.
+	g.Go(func() error { return e.pumpFills(gctx, e.maker, e.hedger) })
+	// Hedge fills (if any): feed risk only, no recursive hedging.
+	if e.hedge != nil {
+		g.Go(func() error { return e.pumpFills(gctx, e.hedge, hedger.NoopHedger{}) })
+	}
 
 	for _, ac := range e.cfg.EnabledAssets() {
 		ac := ac
-		w, err := newAssetWorker(gctx, ac, e.venue, e.feed, e.risk, e.metrics, e.cfg.Risk.ReconcileInterval, e.logger)
+		w, err := newAssetWorker(gctx, ac, e.maker, e.feed, e.risk, e.metrics, e.cfg.Risk.ReconcileInterval, e.logger)
 		if err != nil {
 			return fmt.Errorf("init worker %s: %w", ac.Symbol, err)
 		}
@@ -131,11 +154,11 @@ func (e *Engine) snapshotLoop(ctx context.Context) error {
 	}
 }
 
-func (e *Engine) pumpFills(ctx context.Context) error {
-	venueName := e.venue.Name()
-	ch, err := e.venue.SubscribeFills(ctx)
+func (e *Engine) pumpFills(ctx context.Context, v exchange.Exchange, h hedger.Hedger) error {
+	venueName := v.Name()
+	ch, err := v.SubscribeFills(ctx)
 	if err != nil {
-		return fmt.Errorf("subscribe fills: %w", err)
+		return fmt.Errorf("subscribe fills (%s): %w", venueName, err)
 	}
 	for {
 		select {
@@ -143,14 +166,14 @@ func (e *Engine) pumpFills(ctx context.Context) error {
 			return ctx.Err()
 		case f, ok := <-ch:
 			if !ok {
-				return errors.New("fills channel closed")
+				return fmt.Errorf("fills channel closed for venue %s", venueName)
 			}
 			e.risk.ApplyFill(f)
-			maker := "false"
+			makerLabel := "false"
 			if f.IsMaker {
-				maker = "true"
+				makerLabel = "true"
 			}
-			e.metrics.Fills.WithLabelValues(f.Instrument, venueName, string(f.Side), maker).Inc()
+			e.metrics.Fills.WithLabelValues(f.Instrument, venueName, string(f.Side), makerLabel).Inc()
 			if err := e.sink.RecordFill(ctx, venueName, f); err != nil {
 				e.logger.Warn("fill persist failed", zap.Error(err))
 			}
@@ -164,6 +187,14 @@ func (e *Engine) pumpFills(ctx context.Context) error {
 				zap.Float64("size", f.Size),
 				zap.Bool("maker", f.IsMaker),
 			)
+			// Hedge async — don't block the fill stream on a network call.
+			go func(fill exchange.Fill) {
+				hctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if err := h.OnFill(hctx, fill); err != nil {
+					e.logger.Error("hedge failed", zap.Error(err))
+				}
+			}(f)
 		}
 	}
 }

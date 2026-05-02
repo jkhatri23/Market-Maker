@@ -2,22 +2,16 @@ log:
   level: info
   format: json
 
-# Sizes assume BTC ≈ $78K, SOL ≈ $83. Tuned for a $5K paper balance:
-#   BTC base 0.001 ≈ $78 / level, max 0.05 ≈ $3.9K notional
-#   SOL base 0.5   ≈ $42 / level, max 5    ≈ $415 notional
+# Where the engine quotes (maker_venue) and where it flattens fills
+# (hedge_venue, optional). Each must reference an enabled venue block.
+# Default = paper-only for safe local testing.
+engine:
+  maker_venue: paper        # paper | hyperliquid | binance
+  hedge_venue: ""           # "" disables hedger; otherwise paper|hyperliquid|binance
+
+# Sizes assume SOL ≈ $83. Tuned for a $5K paper balance:
+#   base 0.5 ≈ $42 / level, max 5 ≈ $415 notional
 assets:
-  - symbol: BTC
-    enabled: true
-    base_quantity: 0.001
-    spread_bps: 50
-    requote_threshold_bps: 10
-    max_position: 0.05
-    max_leverage: 2.0
-    depth_levels: 3
-    depth_alpha: 0.6
-    depth_gamma: 1.5
-    skew_factor: 0.4
-    funding_window: 5m
   - symbol: SOL
     enabled: true
     base_quantity: 0.5
@@ -42,11 +36,27 @@ risk:
 paper:
   initial_balance_usd: 5000
 
+hyperliquid:
+  enabled: false
+  base_url: https://api.hyperliquid.xyz
+  ws_url: wss://api.hyperliquid.xyz/ws
+  private_key: ${HYPERLIQUID_PRIVATE_KEY}   # 32-byte hex (with or without 0x)
+  vault_address: ""                          # optional vault hex
+  mainnet: true
+
+binance:
+  enabled: false
+  base_url: https://fapi.binance.com
+  ws_url: wss://fstream.binance.com/ws
+  api_key: ${BINANCE_API_KEY}
+  api_secret: ${BINANCE_API_SECRET}
+  quote_asset: USDT
+  recv_window: 5000
+
 price_feed:
   pyth:
     ws_url: wss://hermes.pyth.network/ws
     feed_ids:
-      BTC: e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43
       SOL: ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d
 
 storage:

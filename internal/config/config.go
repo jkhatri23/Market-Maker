@@ -9,14 +9,44 @@ import (
 )
 
 type Config struct {
-	Log       LogConfig       `yaml:"log"`
-	Assets    []AssetConfig   `yaml:"assets"`
-	Risk      RiskConfig      `yaml:"risk"`
-	Paper     PaperConfig     `yaml:"paper"`
-	PriceFeed PriceFeedConfig `yaml:"price_feed"`
-	Storage   StorageConfig   `yaml:"storage"`
-	Alerts    AlertsConfig    `yaml:"alerts"`
-	Metrics   MetricsConfig   `yaml:"metrics"`
+	Log         LogConfig         `yaml:"log"`
+	Engine      EngineConfig      `yaml:"engine"`
+	Assets      []AssetConfig     `yaml:"assets"`
+	Risk        RiskConfig        `yaml:"risk"`
+	Paper       PaperConfig       `yaml:"paper"`
+	Hyperliquid HyperliquidConfig `yaml:"hyperliquid"`
+	Binance     BinanceConfig     `yaml:"binance"`
+	PriceFeed   PriceFeedConfig   `yaml:"price_feed"`
+	Storage     StorageConfig     `yaml:"storage"`
+	Alerts      AlertsConfig      `yaml:"alerts"`
+	Metrics     MetricsConfig     `yaml:"metrics"`
+}
+
+// EngineConfig wires which venue we quote on (the maker) and which we
+// hedge against. Both must reference an enabled venue block. HedgeVenue
+// is optional — empty string means single-venue MM (paper or naked HL).
+type EngineConfig struct {
+	MakerVenue string `yaml:"maker_venue"` // "paper" | "hyperliquid" | "binance"
+	HedgeVenue string `yaml:"hedge_venue"` // "" | one of the above
+}
+
+type HyperliquidConfig struct {
+	Enabled       bool   `yaml:"enabled"`
+	BaseURL       string `yaml:"base_url"`
+	WSURL         string `yaml:"ws_url"`
+	PrivateKeyHex string `yaml:"private_key"`
+	VaultAddress  string `yaml:"vault_address"`
+	Mainnet       bool   `yaml:"mainnet"`
+}
+
+type BinanceConfig struct {
+	Enabled    bool   `yaml:"enabled"`
+	BaseURL    string `yaml:"base_url"`
+	WSURL      string `yaml:"ws_url"`
+	APIKey     string `yaml:"api_key"`
+	APISecret  string `yaml:"api_secret"`
+	QuoteAsset string `yaml:"quote_asset"` // "USDT"
+	RecvWindow int    `yaml:"recv_window"`
 }
 
 type LogConfig struct {
@@ -138,6 +168,45 @@ func (c *Config) validate() error {
 	}
 	if c.Risk.DailyDrawdownHaltUSD <= 0 {
 		return fmt.Errorf("risk.daily_drawdown_halt_usd must be > 0")
+	}
+	if c.Engine.MakerVenue == "" {
+		c.Engine.MakerVenue = "paper" // safe default
+	}
+	if err := c.checkVenue("engine.maker_venue", c.Engine.MakerVenue); err != nil {
+		return err
+	}
+	if c.Engine.HedgeVenue != "" {
+		if err := c.checkVenue("engine.hedge_venue", c.Engine.HedgeVenue); err != nil {
+			return err
+		}
+		if c.Engine.HedgeVenue == c.Engine.MakerVenue {
+			return fmt.Errorf("engine.hedge_venue must differ from maker_venue")
+		}
+	}
+	return nil
+}
+
+func (c *Config) checkVenue(field, name string) error {
+	switch name {
+	case "paper":
+		// Always available.
+		return nil
+	case "hyperliquid":
+		if !c.Hyperliquid.Enabled {
+			return fmt.Errorf("%s=%q but hyperliquid.enabled=false", field, name)
+		}
+		if c.Hyperliquid.PrivateKeyHex == "" {
+			return fmt.Errorf("%s=%q requires hyperliquid.private_key", field, name)
+		}
+	case "binance":
+		if !c.Binance.Enabled {
+			return fmt.Errorf("%s=%q but binance.enabled=false", field, name)
+		}
+		if c.Binance.APIKey == "" || c.Binance.APISecret == "" {
+			return fmt.Errorf("%s=%q requires binance.api_key + api_secret", field, name)
+		}
+	default:
+		return fmt.Errorf("%s=%q unknown (want paper|hyperliquid|binance)", field, name)
 	}
 	return nil
 }
