@@ -3,6 +3,7 @@ module github.com/jkhatri23/Market-Maker
 go 1.26
 
 require (
+	github.com/gorilla/websocket v1.5.3
 	github.com/jackc/pgx/v5 v5.9.2
 	github.com/prometheus/client_golang v1.23.2
 	go.uber.org/zap v1.28.0

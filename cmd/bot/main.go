@@ -15,6 +15,8 @@ import (
 	"github.com/jkhatri23/Market-Maker/internal/config"
 	"github.com/jkhatri23/Market-Maker/internal/log"
 	"github.com/jkhatri23/Market-Maker/internal/metrics"
+	"github.com/jkhatri23/Market-Maker/internal/pricefeed"
+	"github.com/jkhatri23/Market-Maker/internal/pricefeed/pyth"
 	"github.com/jkhatri23/Market-Maker/internal/risk"
 	"github.com/jkhatri23/Market-Maker/internal/storage"
 )
@@ -73,9 +75,51 @@ func run() error {
 		_ = notifier.Notify(context.Background(), alerts.KindHalt, reason)
 	})
 
-	// Async work: HTTP metrics server. Engine itself is wired in Phase 6/7.
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error { return m.Serve(gctx, cfg.Metrics.Addr) })
+
+	// Price feed: Pyth Hermes if any feed IDs are configured.
+	var feed pricefeed.PriceFeed
+	if len(cfg.PriceFeed.Pyth.FeedIDs) > 0 {
+		client, err := pyth.New(cfg.PriceFeed.Pyth.WSURL, cfg.PriceFeed.Pyth.FeedIDs, logger)
+		if err != nil {
+			return fmt.Errorf("init pyth: %w", err)
+		}
+		feed = client
+		g.Go(func() error { return client.Run(gctx) })
+
+		// Phase 6 sanity log: print every received price for each enabled
+		// asset. Phase 7 replaces this with engine.Run.
+		for _, ac := range cfg.EnabledAssets() {
+			ac := ac
+			ch, err := client.Subscribe(ac.Symbol)
+			if err != nil {
+				logger.Warn("pyth subscribe", zap.String("asset", ac.Symbol), zap.Error(err))
+				continue
+			}
+			g.Go(func() error {
+				for {
+					select {
+					case <-gctx.Done():
+						return gctx.Err()
+					case p, ok := <-ch:
+						if !ok {
+							return nil
+						}
+						logger.Info("price",
+							zap.String("asset", p.Asset),
+							zap.Float64("price", p.Price),
+							zap.Float64("conf", p.Confidence),
+						)
+					}
+				}
+			})
+		}
+		logger.Info("pyth price feed ready", zap.Any("assets", keys(cfg.PriceFeed.Pyth.FeedIDs)))
+	} else {
+		logger.Info("pyth price feed disabled (no feed_ids)")
+	}
+	_ = feed // wired into engine in Phase 7
 
 	enabled := cfg.EnabledAssets()
 	syms := make([]string, 0, len(enabled))
@@ -102,4 +146,12 @@ func run() error {
 
 func isShutdownErr(err error) bool {
 	return err == context.Canceled || err == context.DeadlineExceeded
+}
+
+func keys(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
 }
