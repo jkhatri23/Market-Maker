@@ -141,6 +141,91 @@ func TestRoundTick(t *testing.T) {
 	}
 }
 
+func TestQuote_PullBuysOnlyAsks(t *testing.T) {
+	quotes := Build(QuoteParams{
+		Mid: 100, SpreadBps: 50, BaseQuantity: 1, DepthLevels: 3,
+		DepthAlpha: 0.6, DepthGamma: 1.5, TickSize: 0.01, LotSize: 0.001,
+		PullBuys: true,
+	})
+	for _, q := range quotes {
+		if q.Side == exchange.Buy {
+			t.Errorf("expected no bids when PullBuys=true, got %+v", q)
+		}
+	}
+	if len(quotes) != 3 {
+		t.Errorf("expected 3 asks, got %d", len(quotes))
+	}
+}
+
+func TestQuote_PullSellsOnlyBids(t *testing.T) {
+	quotes := Build(QuoteParams{
+		Mid: 100, SpreadBps: 50, BaseQuantity: 1, DepthLevels: 3,
+		DepthAlpha: 0.6, DepthGamma: 1.5, TickSize: 0.01, LotSize: 0.001,
+		PullSells: true,
+	})
+	for _, q := range quotes {
+		if q.Side == exchange.Sell {
+			t.Errorf("expected no asks when PullSells=true, got %+v", q)
+		}
+	}
+	if len(quotes) != 3 {
+		t.Errorf("expected 3 bids, got %d", len(quotes))
+	}
+}
+
+func TestQuote_MidShiftLowersBothSides(t *testing.T) {
+	base := Build(QuoteParams{
+		Mid: 100, SpreadBps: 100, BaseQuantity: 1, DepthLevels: 1,
+		DepthAlpha: 0.6, DepthGamma: 1.5, TickSize: 0.001, LotSize: 0.001,
+	})
+	shifted := Build(QuoteParams{
+		Mid: 100, SpreadBps: 100, BaseQuantity: 1, DepthLevels: 1,
+		DepthAlpha: 0.6, DepthGamma: 1.5, TickSize: 0.001, LotSize: 0.001,
+		MidShiftBps: -10, // shift mid down 10 bps = 0.1 on a $100 mid
+	})
+	bb, _ := pickOne(base, exchange.Buy)
+	sb, _ := pickOne(shifted, exchange.Buy)
+	ba, _ := pickOne(base, exchange.Sell)
+	sa, _ := pickOne(shifted, exchange.Sell)
+	if !(sb.Price < bb.Price) {
+		t.Errorf("bid should drop with negative shift: base=%v shifted=%v", bb.Price, sb.Price)
+	}
+	if !(sa.Price < ba.Price) {
+		t.Errorf("ask should drop with negative shift: base=%v shifted=%v", ba.Price, sa.Price)
+	}
+}
+
+func TestQuote_ExtraBidBpsWidensBidsOnly(t *testing.T) {
+	base := Build(QuoteParams{
+		Mid: 100, SpreadBps: 50, BaseQuantity: 1, DepthLevels: 1,
+		DepthAlpha: 0.6, DepthGamma: 1.5, TickSize: 0.001, LotSize: 0.001,
+	})
+	wide := Build(QuoteParams{
+		Mid: 100, SpreadBps: 50, BaseQuantity: 1, DepthLevels: 1,
+		DepthAlpha: 0.6, DepthGamma: 1.5, TickSize: 0.001, LotSize: 0.001,
+		ExtraBidBps: 25,
+	})
+	bb, _ := pickOne(base, exchange.Buy)
+	wb, _ := pickOne(wide, exchange.Buy)
+	ba, _ := pickOne(base, exchange.Sell)
+	wa, _ := pickOne(wide, exchange.Sell)
+	if !(wb.Price < bb.Price) {
+		t.Errorf("bid should move further from mid: base=%v wide=%v", bb.Price, wb.Price)
+	}
+	if math.Abs(wa.Price-ba.Price) > 0.001 {
+		t.Errorf("ask should be unchanged: base=%v wide=%v", ba.Price, wa.Price)
+	}
+}
+
+func pickOne(qs []Quote, s exchange.Side) (Quote, bool) {
+	for _, q := range qs {
+		if q.Side == s {
+			return q, true
+		}
+	}
+	return Quote{}, false
+}
+
 func side(qs []Quote, s exchange.Side) []Quote {
 	out := make([]Quote, 0, len(qs))
 	for _, q := range qs {

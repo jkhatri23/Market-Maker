@@ -14,6 +14,7 @@ import (
 	"github.com/jkhatri23/Market-Maker/internal/config"
 	"github.com/jkhatri23/Market-Maker/internal/exchange"
 	"github.com/jkhatri23/Market-Maker/internal/pricefeed"
+	"github.com/jkhatri23/Market-Maker/internal/risk"
 )
 
 // Engine orchestrates one asset worker per enabled asset. Each worker
@@ -26,15 +27,17 @@ type Engine struct {
 	cfg    *config.Config
 	feed   pricefeed.PriceFeed
 	venues map[string]exchange.Exchange
+	risk   *risk.Manager
 	logger *zap.Logger
 }
 
-func New(cfg *config.Config, feed pricefeed.PriceFeed, venues map[string]exchange.Exchange, logger *zap.Logger) *Engine {
-	return &Engine{cfg: cfg, feed: feed, venues: venues, logger: logger}
+func New(cfg *config.Config, feed pricefeed.PriceFeed, venues map[string]exchange.Exchange, riskMgr *risk.Manager, logger *zap.Logger) *Engine {
+	return &Engine{cfg: cfg, feed: feed, venues: venues, risk: riskMgr, logger: logger}
 }
 
-// Run starts one goroutine per enabled asset and blocks until ctx ends or
-// any worker returns an error.
+// Run starts one goroutine per enabled asset, plus a single fan-out
+// goroutine per venue that pumps fills into the risk manager. Blocks
+// until ctx ends or any worker returns an error.
 func (e *Engine) Run(ctx context.Context) error {
 	tradingVenue, ok := e.venues["polymarket"]
 	if !ok {
@@ -42,15 +45,48 @@ func (e *Engine) Run(ctx context.Context) error {
 	}
 
 	g, gctx := errgroup.WithContext(ctx)
+
+	// Fan-out fills: one subscription per venue feeds the risk manager.
+	for name, v := range e.venues {
+		name, v := name, v
+		g.Go(func() error { return e.pumpFills(gctx, name, v) })
+	}
+
 	for _, ac := range e.cfg.EnabledAssets() {
 		ac := ac
-		w, err := newAssetWorker(gctx, ac, tradingVenue, e.feed, e.cfg.Risk.ReconcileInterval, e.logger)
+		w, err := newAssetWorker(gctx, ac, tradingVenue, e.feed, e.risk, e.cfg.Risk.ReconcileInterval, e.logger)
 		if err != nil {
 			return fmt.Errorf("init worker %s: %w", ac.Symbol, err)
 		}
 		g.Go(func() error { return w.Run(gctx) })
 	}
 	return g.Wait()
+}
+
+func (e *Engine) pumpFills(ctx context.Context, venueName string, v exchange.Exchange) error {
+	ch, err := v.SubscribeFills(ctx)
+	if err != nil {
+		return fmt.Errorf("subscribe fills (%s): %w", venueName, err)
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case f, ok := <-ch:
+			if !ok {
+				return fmt.Errorf("fills channel closed for venue %s", venueName)
+			}
+			e.risk.ApplyFill(f)
+			e.logger.Info("fill",
+				zap.String("venue", venueName),
+				zap.String("instrument", f.Instrument),
+				zap.String("side", string(f.Side)),
+				zap.Float64("price", f.Price),
+				zap.Float64("size", f.Size),
+				zap.Bool("maker", f.IsMaker),
+			)
+		}
+	}
 }
 
 // assetWorker is one per (asset × venue). It owns:
@@ -61,6 +97,7 @@ type assetWorker struct {
 	cfg               config.AssetConfig
 	venue             exchange.Exchange
 	feed              pricefeed.PriceFeed
+	risk              *risk.Manager
 	spec              exchange.MarketSpec
 	rec               *Reconciler
 	reconcileInterval time.Duration
@@ -76,6 +113,7 @@ func newAssetWorker(
 	ac config.AssetConfig,
 	venue exchange.Exchange,
 	feed pricefeed.PriceFeed,
+	riskMgr *risk.Manager,
 	reconcileInterval time.Duration,
 	logger *zap.Logger,
 ) (*assetWorker, error) {
@@ -94,6 +132,7 @@ func newAssetWorker(
 		cfg:               ac,
 		venue:             venue,
 		feed:              feed,
+		risk:              riskMgr,
 		spec:              spec,
 		rec:               NewReconciler(venue, ac.Symbol, log),
 		reconcileInterval: reconcileInterval,
@@ -127,19 +166,16 @@ func (w *assetWorker) Run(ctx context.Context) error {
 			if !ok {
 				return errors.New("price feed channel closed")
 			}
+			w.risk.ApplyMark(w.cfg.Symbol, p.Price)
 			if !w.shouldRequote(p.Price) {
 				continue
 			}
-			if err := w.requote(ctx, p.Price); err != nil {
+			if err := w.requote(ctx); err != nil {
 				w.logger.Error("requote failed", zap.Error(err))
 			}
 
 		case <-tick.C:
-			ref, ok := w.lastRef()
-			if !ok {
-				continue
-			}
-			if err := w.requote(ctx, ref); err != nil {
+			if err := w.requote(ctx); err != nil {
 				w.logger.Error("periodic reconcile failed", zap.Error(err))
 			}
 		}
@@ -157,7 +193,25 @@ func (w *assetWorker) shouldRequote(newPrice float64) bool {
 	return moveBps >= w.cfg.RequoteThresholdBps
 }
 
-func (w *assetWorker) requote(ctx context.Context, ref float64) error {
+// requote pulls the latest reference price + age, consults the risk
+// manager, and reconciles the venue's order set accordingly. A deny
+// verdict cancels everything for the asset; an allow verdict produces
+// quotes shaped by the manager's skew/widen/pull instructions.
+func (w *assetWorker) requote(ctx context.Context) error {
+	ref, age, ok := w.feed.GetPrice(w.cfg.Symbol)
+	if !ok {
+		return nil // no price yet; nothing to do
+	}
+
+	v := w.risk.Check(w.cfg, ref, age)
+	if !v.Allow {
+		w.logger.Warn("risk deny", zap.String("reason", v.Reason))
+		if err := w.venue.CancelAllForInstrument(ctx, w.cfg.Symbol); err != nil {
+			return fmt.Errorf("cancel-all on deny: %w", err)
+		}
+		return nil
+	}
+
 	quotes := Build(QuoteParams{
 		Mid:                  ref,
 		SpreadBps:            w.cfg.SpreadBps,
@@ -169,7 +223,13 @@ func (w *assetWorker) requote(ctx context.Context, ref float64) error {
 		LotSize:              w.spec.LotSize,
 		MinSize:              w.spec.MinSize,
 		MaxPositionContracts: w.cfg.MaxPosition,
+		MidShiftBps:          v.MidShiftBps,
+		ExtraBidBps:          v.ExtraBidBps,
+		ExtraAskBps:          v.ExtraAskBps,
+		PullBuys:             v.PullBuys,
+		PullSells:            v.PullSells,
 	})
+
 	res, err := w.rec.Reconcile(ctx, quotes)
 	if err != nil {
 		return err
@@ -180,20 +240,14 @@ func (w *assetWorker) requote(ctx context.Context, ref float64) error {
 	w.mu.Unlock()
 	w.logger.Debug("reconciled",
 		zap.Float64("ref", ref),
+		zap.Float64("mid_shift_bps", v.MidShiftBps),
+		zap.Bool("pull_buys", v.PullBuys),
+		zap.Bool("pull_sells", v.PullSells),
 		zap.Int("placed", res.Placed),
 		zap.Int("canceled", res.Canceled),
 		zap.Int("failed", res.Failed),
 	)
 	return nil
-}
-
-func (w *assetWorker) lastRef() (float64, bool) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.lastQuotedRef == 0 {
-		return 0, false
-	}
-	return w.lastQuotedRef, true
 }
 
 func (w *assetWorker) shutdown() {

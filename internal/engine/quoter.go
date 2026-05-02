@@ -34,6 +34,23 @@ type QuoteParams struct {
 	// curve exceeds this, sizes are scaled down proportionally so we can't
 	// exceed the position limit even if every order fills at once.
 	MaxPositionContracts float64
+
+	// MidShiftBps shifts the effective mid (Avellaneda-Stoikov inventory
+	// skew). Negative when long: bid + ask both move down, encouraging
+	// fills that reduce position. Applied to the mid; spread is unchanged.
+	MidShiftBps float64
+
+	// ExtraBidBps / ExtraAskBps add per-side distance from mid (fill
+	// intensity widening). Used to widen the side that just got swept
+	// without affecting the other.
+	ExtraBidBps float64
+	ExtraAskBps float64
+
+	// PullBuys / PullSells veto an entire side. Set when the position is
+	// at its cap on that side: at +max we PullBuys (asks-only, mean-revert);
+	// at -max we PullSells.
+	PullBuys  bool
+	PullSells bool
 }
 
 // Build computes the desired set of bid/ask orders for the next reconcile
@@ -46,8 +63,11 @@ func Build(p QuoteParams) []Quote {
 	}
 
 	halfSpread := p.Mid * p.SpreadBps / 10_000 / 2
-	out := make([]Quote, 0, p.DepthLevels*2)
+	effectiveMid := p.Mid * (1 + p.MidShiftBps/10_000)
+	extraBid := p.Mid * p.ExtraBidBps / 10_000
+	extraAsk := p.Mid * p.ExtraAskBps / 10_000
 
+	out := make([]Quote, 0, p.DepthLevels*2)
 	for d := 0; d < p.DepthLevels; d++ {
 		size := levelSize(p.BaseQuantity, p.DepthAlpha, p.DepthGamma, d)
 		size = roundDownToLot(size, p.LotSize)
@@ -58,16 +78,26 @@ func Build(p QuoteParams) []Quote {
 			continue
 		}
 
-		// Each level steps out by one base half-spread.
-		dist := halfSpread * float64(1+d)
+		// Per-level distance from mid: one base half-spread per level deeper.
+		bidDist := halfSpread*float64(1+d) + extraBid
+		askDist := halfSpread*float64(1+d) + extraAsk
 
-		bidPrice := roundDownToTick(p.Mid-dist, p.TickSize)
-		askPrice := roundUpToTick(p.Mid+dist, p.TickSize)
-
-		out = append(out,
-			Quote{Side: exchange.Buy, Price: bidPrice, Size: size, Level: d},
-			Quote{Side: exchange.Sell, Price: askPrice, Size: size, Level: d},
-		)
+		if !p.PullBuys {
+			out = append(out, Quote{
+				Side:  exchange.Buy,
+				Price: roundDownToTick(effectiveMid-bidDist, p.TickSize),
+				Size:  size,
+				Level: d,
+			})
+		}
+		if !p.PullSells {
+			out = append(out, Quote{
+				Side:  exchange.Sell,
+				Price: roundUpToTick(effectiveMid+askDist, p.TickSize),
+				Size:  size,
+				Level: d,
+			})
+		}
 	}
 
 	if p.MaxPositionContracts > 0 {
