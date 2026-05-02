@@ -68,3 +68,7 @@ alerts:
     notify_on_fill: false
     notify_on_error: true
     notify_on_circuit_breaker: true
+
+metrics:
+  addr: ":9090"
+  snapshot_interval: 1m

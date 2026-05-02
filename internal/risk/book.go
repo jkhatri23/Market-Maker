@@ -92,6 +92,35 @@ func (b *Book) Realized(asset string) float64 {
 	return b.realized[asset]
 }
 
+// Snapshot returns a point-in-time copy of one asset's state. Used by the
+// engine's PnL snapshot loop to write to storage.
+type Snapshot struct {
+	Position   float64
+	AvgEntry   float64
+	MarkPrice  float64
+	Realized   float64
+	Unrealized float64
+}
+
+func (b *Book) Snapshot(asset string) Snapshot {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	pos := b.positions[asset]
+	avg := b.avgEntries[asset]
+	mark := b.marks[asset]
+	var unrealized float64
+	if mark != 0 {
+		unrealized = (mark - avg) * pos
+	}
+	return Snapshot{
+		Position:   pos,
+		AvgEntry:   avg,
+		MarkPrice:  mark,
+		Realized:   b.realized[asset],
+		Unrealized: unrealized,
+	}
+}
+
 // NetPnL returns realized + unrealized across all assets.
 func (b *Book) NetPnL() float64 {
 	b.mu.RLock()

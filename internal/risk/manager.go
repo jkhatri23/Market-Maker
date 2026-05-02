@@ -43,6 +43,16 @@ type Manager struct {
 	haltMu     sync.RWMutex
 	halted     bool
 	haltReason string
+	onHalt     func(reason string)
+}
+
+// SetHaltHook installs a callback fired exactly once per halt transition.
+// Used by the engine to send a Slack alert + flip the halted gauge
+// without coupling this package to alerts/metrics.
+func (m *Manager) SetHaltHook(fn func(reason string)) {
+	m.haltMu.Lock()
+	defer m.haltMu.Unlock()
+	m.onHalt = fn
 }
 
 // NewManager wires the risk gates from config. maxFeedAge defaults to 5s
@@ -78,13 +88,19 @@ func (m *Manager) ApplyMark(asset string, mark float64) {
 // required) and for the operator panic button.
 func (m *Manager) Halt(reason string) {
 	m.haltMu.Lock()
-	defer m.haltMu.Unlock()
 	if m.halted {
+		m.haltMu.Unlock()
 		return
 	}
 	m.halted = true
 	m.haltReason = reason
+	hook := m.onHalt
+	m.haltMu.Unlock()
+
 	m.logger.Error("risk manager halted", zap.String("reason", reason))
+	if hook != nil {
+		hook(reason)
+	}
 }
 
 func (m *Manager) Reset() {

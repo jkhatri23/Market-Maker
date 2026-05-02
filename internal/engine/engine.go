@@ -11,10 +11,13 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/jkhatri23/Market-Maker/internal/alerts"
 	"github.com/jkhatri23/Market-Maker/internal/config"
 	"github.com/jkhatri23/Market-Maker/internal/exchange"
+	"github.com/jkhatri23/Market-Maker/internal/metrics"
 	"github.com/jkhatri23/Market-Maker/internal/pricefeed"
 	"github.com/jkhatri23/Market-Maker/internal/risk"
+	"github.com/jkhatri23/Market-Maker/internal/storage"
 )
 
 // Engine orchestrates one asset worker per enabled asset. Each worker
@@ -24,15 +27,50 @@ import (
 // Phase 3 deliberately keeps inventory at zero (mid = reference price);
 // Phase 4 wraps with Avellaneda-Stoikov skew + risk gates.
 type Engine struct {
-	cfg    *config.Config
-	feed   pricefeed.PriceFeed
-	venues map[string]exchange.Exchange
-	risk   *risk.Manager
-	logger *zap.Logger
+	cfg      *config.Config
+	feed     pricefeed.PriceFeed
+	venues   map[string]exchange.Exchange
+	risk     *risk.Manager
+	sink     storage.Sink
+	notifier alerts.Notifier
+	metrics  *metrics.Metrics
+	logger   *zap.Logger
 }
 
-func New(cfg *config.Config, feed pricefeed.PriceFeed, venues map[string]exchange.Exchange, riskMgr *risk.Manager, logger *zap.Logger) *Engine {
-	return &Engine{cfg: cfg, feed: feed, venues: venues, risk: riskMgr, logger: logger}
+type Deps struct {
+	Feed     pricefeed.PriceFeed
+	Venues   map[string]exchange.Exchange
+	Risk     *risk.Manager
+	Sink     storage.Sink
+	Notifier alerts.Notifier
+	Metrics  *metrics.Metrics
+}
+
+func New(cfg *config.Config, deps Deps, logger *zap.Logger) *Engine {
+	if deps.Sink == nil {
+		deps.Sink = storage.NoopSink{}
+	}
+	if deps.Notifier == nil {
+		deps.Notifier = alerts.NoopNotifier{}
+	}
+	if deps.Metrics == nil {
+		deps.Metrics = metrics.New()
+	}
+	e := &Engine{
+		cfg:      cfg,
+		feed:     deps.Feed,
+		venues:   deps.Venues,
+		risk:     deps.Risk,
+		sink:     deps.Sink,
+		notifier: deps.Notifier,
+		metrics:  deps.Metrics,
+		logger:   logger,
+	}
+	deps.Risk.SetHaltHook(func(reason string) {
+		e.metrics.Halted.Set(1)
+		_ = e.notifier.Notify(context.Background(), alerts.KindHalt, reason)
+	})
+	return e
 }
 
 // Run starts one goroutine per enabled asset, plus a single fan-out
@@ -54,13 +92,50 @@ func (e *Engine) Run(ctx context.Context) error {
 
 	for _, ac := range e.cfg.EnabledAssets() {
 		ac := ac
-		w, err := newAssetWorker(gctx, ac, tradingVenue, e.feed, e.risk, e.cfg.Risk.ReconcileInterval, e.logger)
+		w, err := newAssetWorker(gctx, ac, tradingVenue, e.feed, e.risk, e.metrics, e.cfg.Risk.ReconcileInterval, e.logger)
 		if err != nil {
 			return fmt.Errorf("init worker %s: %w", ac.Symbol, err)
 		}
 		g.Go(func() error { return w.Run(gctx) })
 	}
+
+	g.Go(func() error { return e.snapshotLoop(gctx) })
 	return g.Wait()
+}
+
+// snapshotLoop writes one PnLSnapshot row per asset to storage on every
+// tick of MetricsConfig.SnapshotInterval. It also refreshes the
+// position/NetPnL prom gauges. Default interval is 1 minute.
+func (e *Engine) snapshotLoop(ctx context.Context) error {
+	interval := e.cfg.Metrics.SnapshotInterval
+	if interval <= 0 {
+		interval = time.Minute
+	}
+	tick := time.NewTicker(interval)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case now := <-tick.C:
+			e.metrics.NetPnL.Set(e.risk.Book.NetPnL())
+			for _, ac := range e.cfg.EnabledAssets() {
+				snap := e.risk.Book.Snapshot(ac.Symbol)
+				e.metrics.Position.WithLabelValues(ac.Symbol).Set(snap.Position)
+				if err := e.sink.RecordPnLSnapshot(ctx, storage.PnLSnapshot{
+					Timestamp:  now,
+					Asset:      ac.Symbol,
+					Position:   snap.Position,
+					AvgEntry:   snap.AvgEntry,
+					MarkPrice:  snap.MarkPrice,
+					Realized:   snap.Realized,
+					Unrealized: snap.Unrealized,
+				}); err != nil {
+					e.logger.Warn("pnl snapshot persist failed", zap.Error(err))
+				}
+			}
+		}
+	}
 }
 
 func (e *Engine) pumpFills(ctx context.Context, venueName string, v exchange.Exchange) error {
@@ -77,6 +152,16 @@ func (e *Engine) pumpFills(ctx context.Context, venueName string, v exchange.Exc
 				return fmt.Errorf("fills channel closed for venue %s", venueName)
 			}
 			e.risk.ApplyFill(f)
+			maker := "false"
+			if f.IsMaker {
+				maker = "true"
+			}
+			e.metrics.Fills.WithLabelValues(f.Instrument, venueName, string(f.Side), maker).Inc()
+			if err := e.sink.RecordFill(ctx, venueName, f); err != nil {
+				e.logger.Warn("fill persist failed", zap.Error(err))
+			}
+			_ = e.notifier.Notify(ctx, alerts.KindFill,
+				fmt.Sprintf("%s %s %s %.6f @ %.2f", venueName, f.Instrument, f.Side, f.Size, f.Price))
 			e.logger.Info("fill",
 				zap.String("venue", venueName),
 				zap.String("instrument", f.Instrument),
@@ -98,6 +183,7 @@ type assetWorker struct {
 	venue             exchange.Exchange
 	feed              pricefeed.PriceFeed
 	risk              *risk.Manager
+	metrics           *metrics.Metrics
 	spec              exchange.MarketSpec
 	rec               *Reconciler
 	reconcileInterval time.Duration
@@ -114,6 +200,7 @@ func newAssetWorker(
 	venue exchange.Exchange,
 	feed pricefeed.PriceFeed,
 	riskMgr *risk.Manager,
+	m *metrics.Metrics,
 	reconcileInterval time.Duration,
 	logger *zap.Logger,
 ) (*assetWorker, error) {
@@ -133,6 +220,7 @@ func newAssetWorker(
 		venue:             venue,
 		feed:              feed,
 		risk:              riskMgr,
+		metrics:           m,
 		spec:              spec,
 		rec:               NewReconciler(venue, ac.Symbol, log),
 		reconcileInterval: reconcileInterval,
@@ -230,9 +318,14 @@ func (w *assetWorker) requote(ctx context.Context) error {
 		PullSells:            v.PullSells,
 	})
 
+	w.metrics.Requotes.WithLabelValues(w.cfg.Symbol, w.venue.Name()).Inc()
 	res, err := w.rec.Reconcile(ctx, quotes)
 	if err != nil {
+		w.metrics.RequoteFailures.WithLabelValues(w.cfg.Symbol, w.venue.Name()).Inc()
 		return err
+	}
+	for _, q := range quotes {
+		w.metrics.OrdersPlaced.WithLabelValues(w.cfg.Symbol, w.venue.Name(), string(q.Side)).Inc()
 	}
 	w.mu.Lock()
 	w.lastQuotedRef = ref

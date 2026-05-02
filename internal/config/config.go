@@ -16,6 +16,7 @@ type Config struct {
 	PriceFeed PriceFeedConfig `yaml:"price_feed"`
 	Storage   StorageConfig   `yaml:"storage"`
 	Alerts    AlertsConfig    `yaml:"alerts"`
+	Metrics   MetricsConfig   `yaml:"metrics"`
 }
 
 type LogConfig struct {
@@ -95,6 +96,16 @@ type SlackConfig struct {
 	NotifyOnFill           bool   `yaml:"notify_on_fill"`
 	NotifyOnError          bool   `yaml:"notify_on_error"`
 	NotifyOnCircuitBreaker bool   `yaml:"notify_on_circuit_breaker"`
+}
+
+type MetricsConfig struct {
+	// Addr is the listen address for the Prometheus /metrics endpoint
+	// (e.g. ":9090"). Empty disables the HTTP server.
+	Addr string `yaml:"addr"`
+
+	// SnapshotInterval controls how often the engine writes a PnL row to
+	// storage and refreshes the position/NetPnL gauges. Defaults to 1m.
+	SnapshotInterval time.Duration `yaml:"snapshot_interval"`
 }
 
 func Load(path string) (*Config, error) {
