@@ -10,6 +10,7 @@ import (
 
 type Config struct {
 	Log       LogConfig       `yaml:"log"`
+	Engine    EngineConfig    `yaml:"engine"`
 	Assets    []AssetConfig   `yaml:"assets"`
 	Risk      RiskConfig      `yaml:"risk"`
 	Venues    VenuesConfig    `yaml:"venues"`
@@ -17,6 +18,13 @@ type Config struct {
 	Storage   StorageConfig   `yaml:"storage"`
 	Alerts    AlertsConfig    `yaml:"alerts"`
 	Metrics   MetricsConfig   `yaml:"metrics"`
+}
+
+type EngineConfig struct {
+	// TradingVenue names which venue the engine quotes on. Must match a
+	// venues.<name> block whose Enabled=true. Phase A is single-venue.
+	// Defaults to "paper" if empty.
+	TradingVenue string `yaml:"trading_venue"`
 }
 
 type LogConfig struct {

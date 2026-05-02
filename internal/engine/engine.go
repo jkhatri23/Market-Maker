@@ -77,10 +77,16 @@ func New(cfg *config.Config, deps Deps, logger *zap.Logger) *Engine {
 // goroutine per venue that pumps fills into the risk manager. Blocks
 // until ctx ends or any worker returns an error.
 func (e *Engine) Run(ctx context.Context) error {
-	tradingVenue, ok := e.venues["polymarket"]
-	if !ok {
-		return errors.New("engine.Run: polymarket venue required (Phase 3 single-venue MM)")
+	venueName := e.cfg.Engine.TradingVenue
+	if venueName == "" {
+		venueName = "paper"
 	}
+	tradingVenue, ok := e.venues[venueName]
+	if !ok {
+		return fmt.Errorf("engine.Run: trading venue %q not in venues map (configured venues: %v)",
+			venueName, venueNames(e.venues))
+	}
+	e.logger.Info("engine starting", zap.String("trading_venue", venueName))
 
 	g, gctx := errgroup.WithContext(ctx)
 
@@ -136,6 +142,14 @@ func (e *Engine) snapshotLoop(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+func venueNames(m map[string]exchange.Exchange) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
 }
 
 func (e *Engine) pumpFills(ctx context.Context, venueName string, v exchange.Exchange) error {
