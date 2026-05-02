@@ -1,0 +1,25 @@
+# Binaries
+/bin/
+/build/
+*.exe
+*.test
+*.out
+
+# Local config
+config.yaml
+config.local.yaml
+.env
+.env.*
+!.env.example
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Go workspace
+go.work
+go.work.sum
+
+# Logs
+*.log

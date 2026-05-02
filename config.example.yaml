@@ -1,0 +1,70 @@
+log:
+  level: info
+  format: json
+
+assets:
+  - symbol: BTC
+    enabled: true
+    base_quantity: 1
+    spread_bps: 50
+    requote_threshold_bps: 10
+    max_position: 5
+    max_leverage: 2.0
+    depth_levels: 3
+    depth_alpha: 0.6
+    depth_gamma: 1.5
+    skew_factor: 0.4
+    funding_window: 5m
+  - symbol: SOL
+    enabled: true
+    base_quantity: 5
+    spread_bps: 80
+    requote_threshold_bps: 15
+    max_position: 20
+    max_leverage: 2.0
+    depth_levels: 3
+    depth_alpha: 0.6
+    depth_gamma: 1.5
+    skew_factor: 0.4
+    funding_window: 5m
+
+risk:
+  daily_drawdown_halt_usd: 100
+  dislocation_pct: 0.02
+  dislocation_window: 30s
+  fill_intensity_window: 2s
+  fill_intensity_threshold: 3
+  reconcile_interval: 30s
+
+venues:
+  polymarket:
+    enabled: true
+    base_url: https://clob.polymarket.com
+    ws_url: wss://ws-subscriptions-clob.polymarket.com/ws
+    api_key: ${POLYMARKET_API_KEY}
+    api_secret: ${POLYMARKET_API_SECRET}
+    api_passphrase: ${POLYMARKET_API_PASSPHRASE}
+  kalshi:
+    enabled: false
+    base_url: https://trading-api.kalshi.com
+    key_id: ${KALSHI_KEY_ID}
+    private_key_path: ${KALSHI_PRIVATE_KEY_PATH}
+
+price_feed:
+  pyth:
+    ws_url: wss://hermes.pyth.network/ws
+    feed_ids:
+      BTC: e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43
+      SOL: ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d
+
+storage:
+  postgres:
+    dsn: ${POSTGRES_DSN}
+
+alerts:
+  slack:
+    enabled: true
+    webhook_url: ${SLACK_WEBHOOK_URL}
+    notify_on_fill: false
+    notify_on_error: true
+    notify_on_circuit_breaker: true
