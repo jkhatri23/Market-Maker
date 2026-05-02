@@ -2,17 +2,17 @@ package exchange
 
 import "context"
 
-// Exchange is the only contract the engine depends on. Polymarket, Kalshi,
-// and any future venue implement this. The engine never imports
-// venue-specific types.
+// Exchange is the only contract the engine depends on. The paper venue
+// implements it today; any real venue would implement the same surface.
+// The engine never imports venue-specific types.
 //
 // Lifecycle: callers pass a context to subscriptions and long-running calls.
 // Closing the context tears down WS connections and goroutines. Channels
 // returned by Subscribe* close when the context ends or on unrecoverable
 // error.
 type Exchange interface {
-	// Name returns a stable identifier ("polymarket", "kalshi"). Used in
-	// logs, metrics labels, and the storage layer.
+	// Name returns a stable identifier ("paper"). Used in logs, metrics
+	// labels, and the storage layer.
 	Name() string
 
 	// --- Market data ---

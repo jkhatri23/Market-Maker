@@ -155,8 +155,8 @@ type Balance struct {
 	UpdatedAt  time.Time
 }
 
-// FundingRate is normalized to per-hour to compare across venues with
-// different settlement windows (Polymarket: 5m..8h, Kalshi: TBD).
+// FundingRate is normalized to per-hour so settlement windows of any
+// length can be compared on a common axis.
 type FundingRate struct {
 	Instrument     string
 	RatePerHour    float64

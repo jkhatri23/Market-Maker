@@ -21,15 +21,12 @@ import (
 )
 
 // Engine orchestrates one asset worker per enabled asset. Each worker
-// owns its venue's order set for its instrument and reconciles whenever
-// the reference price moves enough or the periodic safety tick fires.
-//
-// Phase 3 deliberately keeps inventory at zero (mid = reference price);
-// Phase 4 wraps with Avellaneda-Stoikov skew + risk gates.
+// reconciles whenever the reference price moves enough or the periodic
+// safety tick fires.
 type Engine struct {
 	cfg      *config.Config
 	feed     pricefeed.PriceFeed
-	venues   map[string]exchange.Exchange
+	venue    exchange.Exchange
 	risk     *risk.Manager
 	sink     storage.Sink
 	notifier alerts.Notifier
@@ -39,7 +36,7 @@ type Engine struct {
 
 type Deps struct {
 	Feed     pricefeed.PriceFeed
-	Venues   map[string]exchange.Exchange
+	Venue    exchange.Exchange
 	Risk     *risk.Manager
 	Sink     storage.Sink
 	Notifier alerts.Notifier
@@ -59,7 +56,7 @@ func New(cfg *config.Config, deps Deps, logger *zap.Logger) *Engine {
 	e := &Engine{
 		cfg:      cfg,
 		feed:     deps.Feed,
-		venues:   deps.Venues,
+		venue:    deps.Venue,
 		risk:     deps.Risk,
 		sink:     deps.Sink,
 		notifier: deps.Notifier,
@@ -73,32 +70,22 @@ func New(cfg *config.Config, deps Deps, logger *zap.Logger) *Engine {
 	return e
 }
 
-// Run starts one goroutine per enabled asset, plus a single fan-out
-// goroutine per venue that pumps fills into the risk manager. Blocks
-// until ctx ends or any worker returns an error.
+// Run starts one goroutine per enabled asset, plus a fan-out goroutine
+// that pumps fills into the risk manager. Blocks until ctx ends or any
+// worker returns an error.
 func (e *Engine) Run(ctx context.Context) error {
-	venueName := e.cfg.Engine.TradingVenue
-	if venueName == "" {
-		venueName = "paper"
+	if e.venue == nil {
+		return errors.New("engine.Run: nil venue")
 	}
-	tradingVenue, ok := e.venues[venueName]
-	if !ok {
-		return fmt.Errorf("engine.Run: trading venue %q not in venues map (configured venues: %v)",
-			venueName, venueNames(e.venues))
-	}
-	e.logger.Info("engine starting", zap.String("trading_venue", venueName))
+	e.logger.Info("engine starting", zap.String("venue", e.venue.Name()))
 
 	g, gctx := errgroup.WithContext(ctx)
 
-	// Fan-out fills: one subscription per venue feeds the risk manager.
-	for name, v := range e.venues {
-		name, v := name, v
-		g.Go(func() error { return e.pumpFills(gctx, name, v) })
-	}
+	g.Go(func() error { return e.pumpFills(gctx) })
 
 	for _, ac := range e.cfg.EnabledAssets() {
 		ac := ac
-		w, err := newAssetWorker(gctx, ac, tradingVenue, e.feed, e.risk, e.metrics, e.cfg.Risk.ReconcileInterval, e.logger)
+		w, err := newAssetWorker(gctx, ac, e.venue, e.feed, e.risk, e.metrics, e.cfg.Risk.ReconcileInterval, e.logger)
 		if err != nil {
 			return fmt.Errorf("init worker %s: %w", ac.Symbol, err)
 		}
@@ -144,18 +131,11 @@ func (e *Engine) snapshotLoop(ctx context.Context) error {
 	}
 }
 
-func venueNames(m map[string]exchange.Exchange) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	return out
-}
-
-func (e *Engine) pumpFills(ctx context.Context, venueName string, v exchange.Exchange) error {
-	ch, err := v.SubscribeFills(ctx)
+func (e *Engine) pumpFills(ctx context.Context) error {
+	venueName := e.venue.Name()
+	ch, err := e.venue.SubscribeFills(ctx)
 	if err != nil {
-		return fmt.Errorf("subscribe fills (%s): %w", venueName, err)
+		return fmt.Errorf("subscribe fills: %w", err)
 	}
 	for {
 		select {
@@ -163,7 +143,7 @@ func (e *Engine) pumpFills(ctx context.Context, venueName string, v exchange.Exc
 			return ctx.Err()
 		case f, ok := <-ch:
 			if !ok {
-				return fmt.Errorf("fills channel closed for venue %s", venueName)
+				return errors.New("fills channel closed")
 			}
 			e.risk.ApplyFill(f)
 			maker := "false"
@@ -188,7 +168,7 @@ func (e *Engine) pumpFills(ctx context.Context, venueName string, v exchange.Exc
 	}
 }
 
-// assetWorker is one per (asset × venue). It owns:
+// assetWorker owns the requote loop for one asset:
 //   - subscription to the reference price feed
 //   - the reconciler that mirrors quotes to the venue
 //   - the requote-threshold gate (don't churn on every tick)

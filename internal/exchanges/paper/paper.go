@@ -1,18 +1,14 @@
-// Package paper is a fully-functional simulated venue. It implements
-// exchange.Exchange against a price feed: orders rest in memory, and
-// each price tick "fills" any resting orders the price has crossed.
-//
-// Use it to:
-//   - Run engine.Run end-to-end against live Pyth prices with no real
-//     venue (Phase 8 dry-run).
-//   - Reproduce regression scenarios deterministically by replaying a
-//     recorded price stream.
+// Package paper is the simulated venue that drives this bot. It
+// implements exchange.Exchange against a price feed: orders rest in
+// memory, and each price tick "fills" any resting orders the price has
+// crossed.
 //
 // Matching: a buy at B fills the first time the reference price ≤ B; a
 // sell at A fills when price ≥ A. Fills happen at the order price, not
-// the touch price (more conservative — closer to a real maker fill in a
-// thin book where we'd rest at our quote and walk down with cancellations
-// rather than taking a worse price).
+// the touch price — closer to a real maker fill in a thin book where
+// we'd rest at our quote and cancel rather than take a worse price.
+//
+// Replay a recorded price stream to reproduce a session deterministically.
 package paper
 
 import (

@@ -2,9 +2,6 @@ log:
   level: info
   format: json
 
-engine:
-  trading_venue: paper
-
 # Sizes assume BTC ≈ $78K, SOL ≈ $83. Tuned for a $5K paper balance:
 #   BTC base 0.001 ≈ $78 / level, max 0.05 ≈ $3.9K notional
 #   SOL base 0.5   ≈ $42 / level, max 5    ≈ $415 notional
@@ -42,22 +39,8 @@ risk:
   fill_intensity_threshold: 3
   reconcile_interval: 30s
 
-venues:
-  paper:
-    enabled: true
-    initial_balance_usd: 5000
-  polymarket:
-    enabled: false   # flip to true once perps API endpoints are filled in
-    base_url: https://clob.polymarket.com
-    ws_url: wss://ws-subscriptions-clob.polymarket.com/ws
-    api_key: ${POLYMARKET_API_KEY}
-    api_secret: ${POLYMARKET_API_SECRET}
-    api_passphrase: ${POLYMARKET_API_PASSPHRASE}
-  kalshi:
-    enabled: false   # flip to true once Timeless API endpoints are filled in
-    base_url: https://trading-api.kalshi.com
-    key_id: ${KALSHI_KEY_ID}
-    private_key_path: ${KALSHI_PRIVATE_KEY_PATH}
+paper:
+  initial_balance_usd: 5000
 
 price_feed:
   pyth:

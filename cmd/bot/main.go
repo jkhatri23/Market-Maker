@@ -15,12 +15,9 @@ import (
 	"github.com/jkhatri23/Market-Maker/internal/config"
 	"github.com/jkhatri23/Market-Maker/internal/engine"
 	"github.com/jkhatri23/Market-Maker/internal/exchange"
-	"github.com/jkhatri23/Market-Maker/internal/exchanges/kalshi"
 	"github.com/jkhatri23/Market-Maker/internal/exchanges/paper"
-	"github.com/jkhatri23/Market-Maker/internal/exchanges/polymarket"
 	"github.com/jkhatri23/Market-Maker/internal/log"
 	"github.com/jkhatri23/Market-Maker/internal/metrics"
-	"github.com/jkhatri23/Market-Maker/internal/pricefeed"
 	"github.com/jkhatri23/Market-Maker/internal/pricefeed/pyth"
 	"github.com/jkhatri23/Market-Maker/internal/risk"
 	"github.com/jkhatri23/Market-Maker/internal/storage"
@@ -72,7 +69,6 @@ func run() error {
 		logger.Info("slack notifier ready")
 	}
 
-	// Metrics + risk manager are always created.
 	m := metrics.New()
 	riskMgr := risk.NewManager(cfg.Risk, 0, logger)
 	riskMgr.SetHaltHook(func(reason string) {
@@ -83,83 +79,49 @@ func run() error {
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error { return m.Serve(gctx, cfg.Metrics.Addr) })
 
-	// Price feed: Pyth Hermes if any feed IDs are configured.
-	var feed pricefeed.PriceFeed
-	if len(cfg.PriceFeed.Pyth.FeedIDs) > 0 {
-		client, err := pyth.New(cfg.PriceFeed.Pyth.WSURL, cfg.PriceFeed.Pyth.FeedIDs, logger)
-		if err != nil {
-			return fmt.Errorf("init pyth: %w", err)
-		}
-		feed = client
-		g.Go(func() error { return client.Run(gctx) })
-		logger.Info("pyth price feed ready", zap.Any("assets", keys(cfg.PriceFeed.Pyth.FeedIDs)))
-	} else {
-		logger.Info("pyth price feed disabled (no feed_ids); engine will not start")
+	if len(cfg.PriceFeed.Pyth.FeedIDs) == 0 {
+		return fmt.Errorf("no Pyth feed IDs configured (price_feed.pyth.feed_ids)")
 	}
+	feed, err := pyth.New(cfg.PriceFeed.Pyth.WSURL, cfg.PriceFeed.Pyth.FeedIDs, logger)
+	if err != nil {
+		return fmt.Errorf("init pyth: %w", err)
+	}
+	g.Go(func() error { return feed.Run(gctx) })
+	logger.Info("pyth price feed ready", zap.Any("assets", keys(cfg.PriceFeed.Pyth.FeedIDs)))
 
-	// Build venues map. Each enabled venue gets its own client + (if it
-	// has its own loop) a goroutine on the errgroup.
-	venues := map[string]exchange.Exchange{}
 	specs := buildMarketSpecs(cfg)
-	if cfg.Venues.Paper.Enabled && feed != nil {
-		pe := paper.New("paper", feed, specs, cfg.Venues.Paper.InitialBalanceUSD, logger)
-		venues["paper"] = pe
-		g.Go(func() error { return pe.Run(gctx) })
-		logger.Info("paper venue ready",
-			zap.Float64("initial_balance_usd", cfg.Venues.Paper.InitialBalanceUSD))
-	}
-	if cfg.Venues.Polymarket.Enabled {
-		pm, err := polymarket.New(cfg.Venues.Polymarket, logger)
-		if err != nil {
-			return fmt.Errorf("init polymarket: %w", err)
-		}
-		venues["polymarket"] = pm
-		logger.Info("polymarket venue ready (endpoints stubbed)")
-	}
-	if cfg.Venues.Kalshi.Enabled {
-		kc, err := kalshi.New(cfg.Venues.Kalshi, logger)
-		if err != nil {
-			return fmt.Errorf("init kalshi: %w", err)
-		}
-		venues["kalshi"] = kc
-		logger.Info("kalshi venue ready (endpoints stubbed)")
-	}
+	venue := paper.New("paper", feed, specs, cfg.Paper.InitialBalanceUSD, logger)
+	g.Go(func() error { return venue.Run(gctx) })
+	logger.Info("paper venue ready",
+		zap.Float64("initial_balance_usd", cfg.Paper.InitialBalanceUSD))
 
-	// Start engine if we have a feed and at least one venue.
-	if feed != nil && len(venues) > 0 {
-		eng := engine.New(cfg, engine.Deps{
-			Feed:     feed,
-			Venues:   venues,
-			Risk:     riskMgr,
-			Sink:     sink,
-			Notifier: notifier,
-			Metrics:  m,
-		}, logger)
-		g.Go(func() error { return eng.Run(gctx) })
-	} else {
-		logger.Warn("engine not started (need a price feed and at least one venue)")
-	}
+	eng := engine.New(cfg, engine.Deps{
+		Feed:     feed,
+		Venue:    venue,
+		Risk:     riskMgr,
+		Sink:     sink,
+		Notifier: notifier,
+		Metrics:  m,
+	}, logger)
+	g.Go(func() error { return eng.Run(gctx) })
 
 	enabled := cfg.EnabledAssets()
 	syms := make([]string, 0, len(enabled))
 	for _, a := range enabled {
 		syms = append(syms, a.Symbol)
 	}
-	logger.Info("perps-mm ready",
+	logger.Info("market-maker ready",
 		zap.Strings("assets", syms),
-		zap.Bool("polymarket_enabled", cfg.Venues.Polymarket.Enabled),
-		zap.Bool("kalshi_enabled", cfg.Venues.Kalshi.Enabled),
 		zap.String("metrics_addr", cfg.Metrics.Addr),
 		zap.Float64("daily_drawdown_halt_usd", cfg.Risk.DailyDrawdownHaltUSD),
 	)
 	_ = notifier.Notify(ctx, alerts.KindStartup,
-		fmt.Sprintf("perps-mm up; assets=%v", syms))
+		fmt.Sprintf("market-maker up; assets=%v", syms))
 
 	if err := g.Wait(); err != nil && !isShutdownErr(err) {
 		return err
 	}
 	logger.Info("shutdown complete")
-	_ = sink
 	return nil
 }
 
@@ -175,10 +137,9 @@ func keys(m map[string]string) []string {
 	return out
 }
 
-// buildMarketSpecs returns reasonable defaults for paper trading. Real
-// venue specs come from Exchange.GetMarketSpec when those endpoints land;
-// for paper we hardcode sensible tick/lot for BTC + SOL at current
-// prices (~$78K, ~$83).
+// buildMarketSpecs returns sensible tick/lot defaults for paper trading.
+// BTC and SOL get hand-tuned values; everything else falls back to a
+// generic spec.
 func buildMarketSpecs(cfg *config.Config) map[string]exchange.MarketSpec {
 	out := map[string]exchange.MarketSpec{}
 	for _, ac := range cfg.EnabledAssets() {
