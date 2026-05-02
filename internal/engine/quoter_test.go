@@ -1,0 +1,157 @@
+package engine
+
+import (
+	"math"
+	"testing"
+
+	"github.com/jkhatri23/Market-Maker/internal/exchange"
+)
+
+func TestLevelSize_FirstLevelIsBase(t *testing.T) {
+	got := levelSize(2.0, 0.6, 1.5, 0)
+	if got != 2.0 {
+		t.Errorf("level 0 size = %v, want 2.0", got)
+	}
+}
+
+func TestLevelSize_StrictlyIncreasing(t *testing.T) {
+	prev := levelSize(1.0, 0.6, 1.5, 0)
+	for d := 1; d < 5; d++ {
+		s := levelSize(1.0, 0.6, 1.5, d)
+		if s <= prev {
+			t.Errorf("level %d size %v not greater than level %d size %v", d, s, d-1, prev)
+		}
+		prev = s
+	}
+}
+
+func TestQuote_CountAndSymmetry(t *testing.T) {
+	quotes := Build(QuoteParams{
+		Mid:          50_000,
+		SpreadBps:    50,
+		BaseQuantity: 1,
+		DepthLevels:  3,
+		DepthAlpha:   0.6,
+		DepthGamma:   1.5,
+		TickSize:     0.01,
+		LotSize:      0.001,
+	})
+	if len(quotes) != 6 {
+		t.Fatalf("len(quotes) = %d, want 6 (3 levels × 2 sides)", len(quotes))
+	}
+	bids := side(quotes, exchange.Buy)
+	asks := side(quotes, exchange.Sell)
+	if len(bids) != 3 || len(asks) != 3 {
+		t.Fatalf("bids=%d asks=%d, want 3 each", len(bids), len(asks))
+	}
+	for d := 0; d < 3; d++ {
+		bidDist := 50_000 - bids[d].Price
+		askDist := asks[d].Price - 50_000
+		if math.Abs(bidDist-askDist) > 0.02 {
+			t.Errorf("level %d asymmetric: bid_dist=%v ask_dist=%v", d, bidDist, askDist)
+		}
+	}
+}
+
+func TestQuote_TickAlignment(t *testing.T) {
+	quotes := Build(QuoteParams{
+		Mid:          50_000.123,
+		SpreadBps:    100,
+		BaseQuantity: 1,
+		DepthLevels:  2,
+		DepthAlpha:   0.6,
+		DepthGamma:   1.5,
+		TickSize:     0.5,
+		LotSize:      0.001,
+	})
+	for _, q := range quotes {
+		if !aligned(q.Price, 0.5) {
+			t.Errorf("price %v not aligned to tick 0.5", q.Price)
+		}
+	}
+}
+
+func TestQuote_BidsBelowMidAsksAbove(t *testing.T) {
+	quotes := Build(QuoteParams{
+		Mid:          150,
+		SpreadBps:    80,
+		BaseQuantity: 5,
+		DepthLevels:  3,
+		DepthAlpha:   0.6,
+		DepthGamma:   1.5,
+		TickSize:     0.01,
+		LotSize:      0.001,
+	})
+	for _, q := range quotes {
+		if q.Side == exchange.Buy && q.Price >= 150 {
+			t.Errorf("bid price %v >= mid 150", q.Price)
+		}
+		if q.Side == exchange.Sell && q.Price <= 150 {
+			t.Errorf("ask price %v <= mid 150", q.Price)
+		}
+	}
+}
+
+func TestQuote_MaxPositionScaling(t *testing.T) {
+	quotes := Build(QuoteParams{
+		Mid:                  100,
+		SpreadBps:            50,
+		BaseQuantity:         5,
+		DepthLevels:          3,
+		DepthAlpha:           0.6,
+		DepthGamma:           1.5,
+		TickSize:             0.01,
+		LotSize:              0.001,
+		MaxPositionContracts: 10,
+	})
+	var bid, ask float64
+	for _, q := range quotes {
+		if q.Side == exchange.Buy {
+			bid += q.Size
+		} else {
+			ask += q.Size
+		}
+	}
+	if bid > 10.001 {
+		t.Errorf("bid sum %v exceeds cap 10", bid)
+	}
+	if ask > 10.001 {
+		t.Errorf("ask sum %v exceeds cap 10", ask)
+	}
+}
+
+func TestQuote_ZeroInputsReturnNil(t *testing.T) {
+	if got := Build(QuoteParams{}); got != nil {
+		t.Errorf("expected nil, got %v", got)
+	}
+	if got := Build(QuoteParams{Mid: 100, SpreadBps: 50, BaseQuantity: 1}); got != nil {
+		t.Errorf("expected nil with DepthLevels=0, got %v", got)
+	}
+}
+
+func TestRoundTick(t *testing.T) {
+	if got := roundDownToTick(50_000.7, 1); got != 50_000 {
+		t.Errorf("roundDown 50000.7/1 = %v, want 50000", got)
+	}
+	if got := roundUpToTick(50_000.1, 1); got != 50_001 {
+		t.Errorf("roundUp 50000.1/1 = %v, want 50001", got)
+	}
+	if got := roundDownToTick(50_000.7, 0); got != 50_000.7 {
+		t.Errorf("zero tick should be no-op, got %v", got)
+	}
+}
+
+func side(qs []Quote, s exchange.Side) []Quote {
+	out := make([]Quote, 0, len(qs))
+	for _, q := range qs {
+		if q.Side == s {
+			out = append(out, q)
+		}
+	}
+	return out
+}
+
+func aligned(price, tick float64) bool {
+	r := math.Mod(price, tick)
+	return r < 1e-9 || math.Abs(r-tick) < 1e-9
+}
