@@ -37,15 +37,18 @@ risk:
   reconcile_interval: 30s
 
 venues:
-  polymarket:
+  paper:
     enabled: true
+    initial_balance_usd: 5000
+  polymarket:
+    enabled: false   # flip to true once perps API endpoints are filled in
     base_url: https://clob.polymarket.com
     ws_url: wss://ws-subscriptions-clob.polymarket.com/ws
     api_key: ${POLYMARKET_API_KEY}
     api_secret: ${POLYMARKET_API_SECRET}
     api_passphrase: ${POLYMARKET_API_PASSPHRASE}
   kalshi:
-    enabled: false
+    enabled: false   # flip to true once Timeless API endpoints are filled in
     base_url: https://trading-api.kalshi.com
     key_id: ${KALSHI_KEY_ID}
     private_key_path: ${KALSHI_PRIVATE_KEY_PATH}

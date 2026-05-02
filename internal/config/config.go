@@ -49,8 +49,14 @@ type RiskConfig struct {
 }
 
 type VenuesConfig struct {
+	Paper      PaperConfig      `yaml:"paper"`
 	Polymarket PolymarketConfig `yaml:"polymarket"`
 	Kalshi     KalshiConfig     `yaml:"kalshi"`
+}
+
+type PaperConfig struct {
+	Enabled           bool    `yaml:"enabled"`
+	InitialBalanceUSD float64 `yaml:"initial_balance_usd"`
 }
 
 type PolymarketConfig struct {
